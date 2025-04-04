@@ -1,11 +1,12 @@
 ﻿using Azure.Identity;
 using Azure.Security.KeyVault.Secrets;
 using Square;
-using Square.Models;
-using Square.Exceptions;
+using Square;
+using Square.Invoices;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 
 class Program
@@ -22,73 +23,30 @@ class Program
         var secretClient = new SecretClient(new Uri(keyVaultUrl), new DefaultAzureCredential());
 
         // Retrieve the Square refresh token from Key Vault
-        var refreshTokenSecretName = "SquareRefreshToken";
-        KeyVaultSecret refreshTokenSecret;
-        try
-        {
-            refreshTokenSecret = await secretClient.GetSecretAsync(refreshTokenSecretName);
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Error retrieving refresh token from Key Vault: {ex.Message}");
-            return;
-        }
-
-        string squareRefreshToken = refreshTokenSecret.Value;
-        if (string.IsNullOrEmpty(squareRefreshToken))
-        {
-            Console.WriteLine("Error: Square refresh token is empty.");
-            return;
-        }
+        var squareRefreshToken = await secretClient.GetSecretValueAsync("SquareRefreshToken");
+        var squareAccessToken = await secretClient.GetSecretValueAsync("SquareAccessToken");
 
         // Exchange the refresh token for a new access token
-        var oAuthApi = new Square.Apis.OAuthApi();
-        Square.Models.ObtainTokenResponse tokenResponse;
-        try
-        {
-            tokenResponse = await oAuthApi.ObtainTokenAsync(new Square.Models.ObtainTokenRequest
-            {
-                ClientId = Environment.GetEnvironmentVariable("SQUARE_CLIENT_ID"),
-                ClientSecret = Environment.GetEnvironmentVariable("SQUARE_CLIENT_SECRET"),
-                GrantType = "refresh_token",
-                RefreshToken = squareRefreshToken
-            });
-        }
-        catch (ApiException ex)
-        {
-            Console.WriteLine($"Error exchanging refresh token: {ex.Message}");
-            return;
-        }
+        var baseUrl = Environment.GetEnvironmentVariable("SQUARE_BASE_URL");
+        var clientId = Environment.GetEnvironmentVariable("SQUARE_CLIENT_ID");
+        var clientSecret = Environment.GetEnvironmentVariable("SQUARE_CLIENT_SECRET");
 
-        string squareAccessToken = tokenResponse.AccessToken;
-        if (string.IsNullOrEmpty(squareAccessToken))
+        using (var httpClient = new HttpClient())
         {
-            Console.WriteLine("Error: Failed to retrieve Square access token.");
-            return;
-        }
-
-        // Update the refresh token in Key Vault
-        try
-        {
-            await secretClient.SetSecretAsync(refreshTokenSecretName, tokenResponse.RefreshToken);
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Error updating refresh token in Key Vault: {ex.Message}");
-            return;
+            squareAccessToken = await RefreshTokenAsync(baseUrl, clientId, clientSecret, squareRefreshToken, httpClient, secretClient);
         }
 
         // Initialize Square client with the new access token
-        var client = new SquareClient.Builder()
-            .AccessToken(squareAccessToken)
-            .Environment(Square.Environment.Production)
-            .Build();
+        var squareClient = new SquareClient(squareAccessToken,
+            new ClientOptions
+            {
+                BaseUrl = baseUrl
+            });
 
         try
         {
             // Query unpaid invoices older than 30 days
-            var invoicesApi = client.InvoicesApi;
-            var invoices = await GetUnpaidInvoicesOlderThan30Days(invoicesApi);
+            var invoices = await GetUnpaidInvoicesOlderThan30Days(squareClient);
 
             if (!invoices.Any())
             {
@@ -97,14 +55,10 @@ class Program
             }
 
             // Add $10 late fee to each invoice and update them in parallel
-            var updateTasks = invoices.Select(invoice => AddLateFeeAndUpdateInvoice(invoicesApi, invoice));
+            var updateTasks = invoices.Select(invoice => AddLateFeeAndUpdateInvoice(squareClient, invoice));
             await Task.WhenAll(updateTasks);
 
             Console.WriteLine("All invoices updated successfully.");
-        }
-        catch (ApiException ex)
-        {
-            Console.WriteLine($"Square API error: {ex.Message}");
         }
         catch (Exception ex)
         {
@@ -112,10 +66,25 @@ class Program
         }
     }
 
-    private static async Task<List<Invoice>> GetUnpaidInvoicesOlderThan30Days(InvoicesApi invoicesApi)
+    private static async Task<List<Invoice>> GetUnpaidInvoicesOlderThan30Days(SquareClient square)
     {
         var result = new List<Invoice>();
-        var response = await invoicesApi.ListInvoicesAsync();
+        var request = new SearchInvoicesRequest(
+            Query: new InvoiceQuery
+            {
+                Filter: new InvoiceFilter
+                {
+                    Status = new List<string> { "UNPAID" },
+                    DueDateRange = new DateRange
+                    {
+                        StartAt = DateTime.UtcNow.AddDays(-30).ToString("yyyy-MM-dd"),
+                        EndAt = DateTime.UtcNow.ToString("yyyy-MM-dd")
+                    }
+                },
+                Sort: new List<SortField> { new SortField("DUE_DATE", SortOrder.ASC) }
+            }
+        )
+        var response = await square.Invoices.GetAsync()
 
         foreach (var invoice in response.Invoices)
         {
@@ -148,6 +117,60 @@ class Program
         catch (ApiException ex)
         {
             Console.WriteLine($"Failed to update invoice {invoice.Id}: {ex.Message}");
+        }
+    }
+
+    private static async Task<string> RefreshTokenAsync(string baseUrl, string clientId, string clientSecret, string refreshToken, HttpClient httpClient, SecretClient secretClient)
+   
+    {
+        var parms = new Dictionary<string, string>
+        {
+            { "client_id", clientId },
+            { "client_secret", clientSecret },
+            { "grant_type", "refresh_token" },
+            { "refresh_token", refreshToken }
+        };
+
+        var response = await httpClient.PostAsync($"{baseUrl}/oauth2/token", new FormUrlEncodedContent(parms));
+
+        if (response.IsSuccessStatusCode)
+        {
+            // Store the access token and refresh token securely in Azure KeyVault
+            var responseContent = await response.Content.ReadAsStringAsync();
+            var responseJson = System.Text.Json.JsonDocument.Parse(responseContent).RootElement;
+
+            var accessToken = responseJson.GetProperty("access_token").GetString();
+            var newRefreshToken = responseJson.GetProperty("refresh_token").GetString();
+
+            await secretClient.SetSecretAsync("SquareAccessToken", accessToken);
+            await secretClient.SetSecretAsync("SquareRefreshToken", newRefreshToken);
+
+            return accessToken;
+        }
+        else
+        {
+            throw new InvalidOperationException($"Failed to refresh token: {response.StatusCode}");
+        }
+    }
+}
+
+public static class SecretClientExtensions
+{
+    public static async Task<string> GetSecretValueAsync(this SecretClient secretClient, string secretName)
+    {
+        try
+        {
+            var secret = await secretClient.GetSecretAsync(secretName);
+            if (secret.Value == null || string.IsNullOrEmpty(secret.Value.Value))
+            {
+                throw new InvalidOperationException($"Error: Secret value '{secretName}' is empty.");
+            }
+
+            return secret.Value.Value;
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException($"Error retrieving secret '{secretName}' from Key Vault: {ex.Message}", ex);
         }
     }
 }
